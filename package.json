@@ -1,0 +1,12 @@
+{
+  "name": "dns-sinkhole",
+  "version": "1.0.0",
+  "description": "Custom DoH DNS server that shows a message for every site",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
