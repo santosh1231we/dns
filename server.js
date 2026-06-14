@@ -1,81 +1,68 @@
 const http = require("http");
 const dns = require("dns");
-const os = require("os");
 
 // ───────────────────────────────────────────
 // ✏️  EDIT YOUR MESSAGE HERE
 const YOUR_MESSAGE = "🚫 This site has been blocked by your DNS server.";
 // ───────────────────────────────────────────
 
-const PORT = process.env.PORT || 3000;
-let MY_IP = null; // will be resolved at startup
+const PORT = process.env.PORT || 8080;
+let MY_IP_BYTES = [0, 0, 0, 0];
 
-// Fetch our own public IP at startup
 async function resolveOwnIp() {
-  return new Promise((resolve) => {
-    // Railway sets RAILWAY_PUBLIC_DOMAIN env var
-    const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
-    if (railwayDomain) {
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  console.log("Railway domain:", railwayDomain);
+
+  if (railwayDomain) {
+    return new Promise((resolve) => {
       dns.lookup(railwayDomain, (err, address) => {
         if (!err && address) {
-          console.log(`Resolved Railway IP from domain: ${address}`);
-          resolve(address);
+          console.log("Own IP resolved:", address);
+          MY_IP_BYTES = address.split(".").map(Number);
+          resolve();
         } else {
-          fallback(resolve);
+          console.log("DNS lookup failed:", err?.message);
+          resolve();
         }
       });
-    } else {
-      fallback(resolve);
-    }
-  });
-}
-
-function fallback(resolve) {
-  // fallback: use ipify to get public IP
-  http.get("http://api.ipify.org", (res) => {
-    let data = "";
-    res.on("data", c => data += c);
-    res.on("end", () => {
-      const ip = data.trim();
-      console.log(`Resolved public IP via ipify: ${ip}`);
-      resolve(ip);
     });
-  }).on("error", () => {
-    console.log("Could not resolve public IP, using 127.0.0.1");
-    resolve("127.0.0.1");
-  });
+  }
 }
 
-// Parse IP string into 4 bytes
-function ipToBytes(ip) {
-  return ip.split(".").map(Number);
-}
-
-// Build a DNS A-record response pointing to MY_IP
-function buildDnsResponse(query) {
+// Properly parse DNS wire format and build a valid A record response
+function buildDnsResponse(queryBuf) {
   try {
-    const response = Buffer.alloc(query.length);
-    query.copy(response);
+    // Transaction ID (2 bytes)
+    const txId = queryBuf.slice(0, 2);
 
-    response[2] = 0x81; // QR=1, AA=1
-    response[3] = 0x80; // RA=1, RCODE=0
-    response[6] = 0x00;
-    response[7] = 0x01; // answer count = 1
+    // Flags: QR=1 response, AA=1 authoritative, RD copy from query, RA=1
+    const rdBit = (queryBuf[2] & 0x01) ? 0x01 : 0x00;
+    const flags = Buffer.from([0x81 | rdBit, 0x80]);
 
-    const ipBytes = ipToBytes(MY_IP || "127.0.0.1");
+    // QDCOUNT from query
+    const qdCount = queryBuf.slice(4, 6);
+    // ANCOUNT = 1
+    const anCount = Buffer.from([0x00, 0x01]);
+    // NSCOUNT, ARCOUNT = 0
+    const zeros = Buffer.from([0x00, 0x00, 0x00, 0x00]);
 
+    // Copy the question section exactly
+    const question = queryBuf.slice(12);
+
+    // Answer: name pointer + type A + class IN + TTL + rdlength + IP
     const answer = Buffer.from([
-      0xc0, 0x0c,             // pointer to question name
-      0x00, 0x01,             // type A
-      0x00, 0x01,             // class IN
-      0x00, 0x00, 0x00, 0x1e, // TTL 30s
-      0x00, 0x04,             // rdlength = 4
-      ...ipBytes              // the IP address
+      0xc0, 0x0c,                          // name pointer to offset 12
+      0x00, 0x01,                          // type A
+      0x00, 0x01,                          // class IN
+      0x00, 0x00, 0x00, 0x1e,             // TTL = 30
+      0x00, 0x04,                          // rdlength = 4
+      ...MY_IP_BYTES                        // IPv4 address
     ]);
 
-    return Buffer.concat([response, answer]);
-  } catch {
-    return query;
+    return Buffer.concat([txId, flags, qdCount, anCount, zeros, question, answer]);
+  } catch (e) {
+    console.error("DNS build error:", e);
+    return queryBuf;
   }
 }
 
@@ -105,17 +92,8 @@ const MESSAGE_PAGE = `<!DOCTYPE html>
       border: 1px solid #e5e5e5;
     }
     .icon { font-size: 3rem; margin-bottom: 1rem; }
-    .message {
-      font-size: 1.25rem;
-      font-weight: 500;
-      color: #111;
-      line-height: 1.6;
-    }
-    .sub {
-      margin-top: 1rem;
-      font-size: 0.85rem;
-      color: #999;
-    }
+    .message { font-size: 1.25rem; font-weight: 500; color: #111; line-height: 1.6; }
+    .sub { margin-top: 1rem; font-size: 0.85rem; color: #999; }
   </style>
 </head>
 <body>
@@ -130,41 +108,41 @@ const MESSAGE_PAGE = `<!DOCTYPE html>
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost`);
 
-  // ── DoH endpoint ──────────────────────────────────────────
+  // ── DoH endpoint ─────────────────────────────────────────
   if (url.pathname === "/dns-query") {
+    const handleQuery = (queryBuf) => {
+      const dnsResp = buildDnsResponse(queryBuf);
+      res.writeHead(200, {
+        "Content-Type": "application/dns-message",
+        "Content-Length": dnsResp.length,
+        "Cache-Control": "no-cache"
+      });
+      res.end(dnsResp);
+    };
+
     if (req.method === "GET") {
       const dnsParam = url.searchParams.get("dns");
       if (!dnsParam) { res.writeHead(400); res.end("Missing dns param"); return; }
-      const query = Buffer.from(dnsParam, "base64url");
-      const dnsResp = buildDnsResponse(query);
-      res.writeHead(200, { "Content-Type": "application/dns-message" });
-      res.end(dnsResp);
+      handleQuery(Buffer.from(dnsParam, "base64url"));
     } else if (req.method === "POST") {
       const chunks = [];
       req.on("data", c => chunks.push(c));
-      req.on("end", () => {
-        const query = Buffer.concat(chunks);
-        const dnsResp = buildDnsResponse(query);
-        res.writeHead(200, { "Content-Type": "application/dns-message" });
-        res.end(dnsResp);
-      });
+      req.on("end", () => handleQuery(Buffer.concat(chunks)));
     } else {
       res.writeHead(405); res.end();
     }
     return;
   }
 
-  // ── Message page for every other request ──────────────────
+  // ── Message page ─────────────────────────────────────────
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(MESSAGE_PAGE);
 });
 
-// Startup: resolve our IP first, then start listening
-resolveOwnIp().then((ip) => {
-  MY_IP = ip;
+resolveOwnIp().then(() => {
   server.listen(PORT, () => {
-    console.log(`✅ DNS sinkhole running on port ${PORT}`);
-    console.log(`📡 Pointing all DNS to: ${MY_IP}`);
-    console.log(`🔗 DoH URL: https://${process.env.RAILWAY_PUBLIC_DOMAIN || "YOUR-RAILWAY-URL"}/dns-query`);
+    console.log(`✅ Running on port ${PORT}`);
+    console.log(`📡 DNS resolves to: ${MY_IP_BYTES.join(".")}`);
+    console.log(`🔗 DoH URL: https://${process.env.RAILWAY_PUBLIC_DOMAIN || "localhost"}/dns-query`);
   });
 });
