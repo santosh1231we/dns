@@ -6,9 +6,6 @@
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "dns-packet": "^5.6.1"
-  },
   "engines": {
     "node": ">=18"
   }

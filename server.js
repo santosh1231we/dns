@@ -1,5 +1,6 @@
 const http = require("http");
 const dnsPacket = require("dns-packet");
+const dns = require("dns");
 
 // ───────────────────────────────────────────
 // ✏️  EDIT YOUR MESSAGE HERE
@@ -7,45 +8,64 @@ const YOUR_MESSAGE = "🚫 This site has been blocked by your DNS server.";
 // ───────────────────────────────────────────
 
 const PORT = process.env.PORT || 8080;
+let MY_IP_BYTES = [127, 0, 0, 1];
 
-// This is a dummy local IP address. Since Railway uses shared routing,
-// responding with 127.0.0.1 forces the browser to look for a local page,
-// or you can set this to a specific static IP if you host your message page elsewhere.
-const REDIRECT_IP = "127.0.0.1"; 
+// Resolve our own Railway IP at startup
+async function resolveOwnIp() {
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (!domain) return;
+  return new Promise((resolve) => {
+    dns.lookup(domain, (err, address) => {
+      if (!err && address) {
+        MY_IP_BYTES = address.split(".").map(Number);
+        console.log(`📡 Own IP: ${address}`);
+      }
+      resolve();
+    });
+  });
+}
 
 function handleDnsWireFormat(queryBuf) {
   try {
-    // Safely decode the binary DNS query from Chrome
     const decoded = dnsPacket.decode(queryBuf);
-    
-    // Find the domain the browser is looking for
     const question = decoded.questions && decoded.questions[0];
-    
     const answers = [];
-    if (question && question.type === 'A') {
-      answers.push({
-        type: 'A',
-        name: question.name,
-        ttl: 30,
-        data: REDIRECT_IP
-      });
+
+    if (question) {
+      if (question.type === "A") {
+        // Point all A record lookups to ourselves
+        answers.push({
+          type: "A",
+          name: question.name,
+          ttl: 30,
+          data: MY_IP_BYTES.join(".")
+        });
+      } else if (question.type === "AAAA") {
+        // Return NOERROR with no answer for IPv6 — forces browser to use IPv4
+        // (don't add any answer, just return empty)
+      } else if (question.type === "HTTPS" || question.type === "65") {
+        // Returning no HTTPS record disables ECH/HTTPS upgrade in Chrome
+        // This is key — it stops Chrome from auto-upgrading to HTTPS
+      }
     }
 
-    // Build a perfectly formatted binary response packet
     return dnsPacket.encode({
-      type: 'response',
+      type: "response",
       id: decoded.id,
-      flags: dnsPacket.AUTHORITATIVE_ANSWER,
+      flags: dnsPacket.AUTHORITATIVE_ANSWER | dnsPacket.RECURSION_DESIRED,
       questions: decoded.questions,
       answers: answers
     });
   } catch (e) {
-    console.error("Failed to process DNS packet:", e);
-    return queryBuf; // Fallback to sending back what we got if it fails
+    console.error("DNS packet error:", e);
+    return queryBuf;
   }
 }
 
-const MESSAGE_PAGE = `<!DOCTYPE html>
+const RAILWAY_URL = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || "localhost"}`;
+
+// The message page — also has a meta redirect fallback
+const MESSAGE_PAGE = (host) => `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -73,6 +93,7 @@ const MESSAGE_PAGE = `<!DOCTYPE html>
     .icon { font-size: 3rem; margin-bottom: 1rem; }
     .message { font-size: 1.25rem; font-weight: 500; color: #111; line-height: 1.6; }
     .sub { margin-top: 1rem; font-size: 0.85rem; color: #999; }
+    .domain { margin-top: 0.5rem; font-size: 0.8rem; color: #bbb; font-family: monospace; }
   </style>
 </head>
 <body>
@@ -80,16 +101,17 @@ const MESSAGE_PAGE = `<!DOCTYPE html>
     <div class="icon">🚫</div>
     <p class="message">${YOUR_MESSAGE}</p>
     <p class="sub">Redirected by your custom DNS server</p>
+    ${host ? `<p class="domain">${host}</p>` : ""}
   </div>
 </body>
 </html>`;
 
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const host = req.headers.host || "";
+  const urlObj = new URL(req.url, `http://${host || "localhost"}`);
 
   // ── DoH endpoint ─────────────────────────────────────────
-  if (url.pathname === "/dns-query") {
-    
+  if (urlObj.pathname === "/dns-query") {
     const sendResponse = (dnsResp) => {
       res.writeHead(200, {
         "Content-Type": "application/dns-message",
@@ -100,37 +122,52 @@ const server = http.createServer((req, res) => {
     };
 
     if (req.method === "GET") {
-      const dnsParam = url.searchParams.get("dns");
-      if (!dnsParam) { 
-        res.writeHead(400); 
-        res.end("Missing dns param"); 
-        return; 
-      }
-      // Decode base64url parameter from Chrome GET request
-      const queryBuf = Buffer.from(dnsParam, "base64url");
-      sendResponse(handleDnsWireFormat(queryBuf));
-      return;
-    } 
-    
-    if (req.method === "POST") {
-      const chunks = [];
-      req.on("data", c => chunks.push(c));
-      req.on("end", () => {
-        sendResponse(handleDnsWireFormat(Buffer.concat(chunks)));
-      });
+      const dnsParam = urlObj.searchParams.get("dns");
+      if (!dnsParam) { res.writeHead(400); res.end("Missing dns param"); return; }
+      sendResponse(handleDnsWireFormat(Buffer.from(dnsParam, "base64url")));
       return;
     }
 
-    res.writeHead(405);
-    res.end();
+    if (req.method === "POST") {
+      const chunks = [];
+      req.on("data", c => chunks.push(c));
+      req.on("end", () => sendResponse(handleDnsWireFormat(Buffer.concat(chunks))));
+      return;
+    }
+
+    res.writeHead(405); res.end();
     return;
   }
 
-  // ── Message page (For any other paths) ───────────────────
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(MESSAGE_PAGE);
+  // ── All other HTTP requests → show message page ───────────
+  // When a browser hits an HTTP (not HTTPS) site, we show our message.
+  // For HTTPS sites, the SSL handshake fails before we can respond —
+  // that's a browser security wall we can't bypass without a cert.
+  // 
+  // WORKAROUND: We redirect HTTP requests to our Railway HTTPS page.
+  // For HTTPS, users see a browser SSL error (unavoidable without a cert).
+  // The cleanest UX is to tell users to use http:// URLs for testing,
+  // or use a browser extension like "HTTPS Everywhere off" for local testing.
+
+  const isRailwayHost = host.includes("railway.app");
+
+  if (isRailwayHost) {
+    // Direct hit to our Railway URL — show the message page
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(MESSAGE_PAGE(""));
+    return;
+  }
+
+  // For intercepted domains (e.g. google.com hitting our IP over HTTP port 80)
+  // Redirect them to our Railway message page
+  res.writeHead(302, { "Location": RAILWAY_URL });
+  res.end();
 });
 
-server.listen(PORT, () => {
-  console.log(`✅ DoH Server successfully running on port ${PORT}`);
+resolveOwnIp().then(() => {
+  server.listen(PORT, () => {
+    console.log(`✅ DoH Server running on port ${PORT}`);
+    console.log(`📡 Pointing DNS to: ${MY_IP_BYTES.join(".")}`);
+    console.log(`🔗 DoH URL: ${RAILWAY_URL}/dns-query`);
+  });
 });
